@@ -1,0 +1,14 @@
+{
+  "name": "codex-subagent",
+  "owner": {
+    "name": "kirillshsh"
+  },
+  "plugins": [
+    {
+      "name": "codex-subagent",
+      "source": "./plugins/codex-subagent",
+      "description": "Codex CLI as a Claude Code subagent: code exploration, hard-bug diagnosis and backend work on request.",
+      "version": "1.0.0"
+    }
+  ]
+}

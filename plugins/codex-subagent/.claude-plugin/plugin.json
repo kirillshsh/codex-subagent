@@ -1,0 +1,10 @@
+{
+  "name": "codex-subagent",
+  "version": "1.0.0",
+  "description": "Codex CLI as a Claude Code subagent: code exploration, hard-bug diagnosis and backend work on request.",
+  "author": {
+    "name": "kirillshsh"
+  },
+  "license": "MIT",
+  "keywords": ["codex", "subagent", "exploration", "openai"]
+}
