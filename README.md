@@ -8,11 +8,18 @@ A Claude Code skill that uses the [Codex CLI](https://github.com/openai/codex) a
 
 - **Exploration by default.** Codex reads the code, runs tests and reproduces bugs, but doesn't edit the project.
 - **Hard bugs** (`--heavy`) go to a stronger model.
+- **Any model you name.** Say "use astra on max" and Claude runs `--model astra --effort max`; `--models` lists your account's models and their efforts.
 - **Backend work** (`--backend`) only when you ask Claude to have Codex write it. Frontend stays with Claude unless you allow it (`--allow-frontend`).
 - **Sandbox.** Codex writes only inside the project and `/tmp`. `--yolo` turns the sandbox off.
 - **Parallel runs.** When all your account's parallel slots are busy (HTTP 429), the wrapper waits for one instead of failing.
 - **Follow-ups.** `--resume` continues the same Codex conversation.
 - **A diff check after every run.** The wrapper lists Codex's patches and anything else that changed in the tree, and warns when exploration edited files or Codex touched the frontend.
+
+## Where Codex is weak, and what the skill does about it
+
+- **UI and UX taste.** Codex's layouts, styles and copy come out generic. Frontend work stays with Claude unless you ask for Codex.
+- **Little initiative.** Codex tends to answer the literal question, stop at the first plausible cause and end with "if you want, I can…". Every run tells it to confirm the cause, follow it through and do the work instead of offering it.
+- **Overengineering and junk fallbacks.** Codex likes extra layers, try/except everywhere, silent default values and checks for things that can't happen. Every run tells it to write the simplest code that does the task and to let real errors surface; Claude then reads the diff for leftovers.
 
 ## Requirements
 
@@ -56,7 +63,7 @@ python3 ~/.claude/skills/codex/codex_agent.py -C /abs/path/to/project "Where is 
 | `CODEX_AGENT_YOLO` | off | `1` removes the sandbox for every run |
 | `CODEX_AGENT_HOME` | `~/.claude/codex-agent` | Where runs are kept (7 days) |
 
-If your account doesn't have a model, the wrapper retries once on Codex's default model.
+A default model your account doesn't have gives way to Codex's own default. A model or effort you ask for by name must exist: otherwise the run stops with the list of what your account has.
 
 ## Safety
 

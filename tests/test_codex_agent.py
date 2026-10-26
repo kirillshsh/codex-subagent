@@ -23,6 +23,11 @@ args = sys.argv[1:]
 if "--help" in args:
     print(os.environ.get("FAKE_HELP", "--ignore-user-config\n--ignore-rules\n--disable <FEATURE>"))
     sys.exit(0)
+if args[:2] == ["debug", "models"]:
+    if "FAKE_CATALOG" not in os.environ:  # an older CLI without the command
+        sys.exit(2)
+    print(os.environ["FAKE_CATALOG"])
+    sys.exit(0)
 prompt = sys.stdin.read()
 log = os.environ["FAKE_LOG"]
 with open(log, "a") as fh:
@@ -36,11 +41,6 @@ def emit(event):
 
 emit({"type": "thread.started", "thread_id": thread})
 emit({"type": "turn.started"})
-if mode == "nomodel" and "-m" in args:
-    message = "The 'gpt-6.1-terra' model is not supported when using Codex with a ChatGPT account."
-    emit({"type": "error", "message": message})
-    emit({"type": "turn.failed", "error": {"message": message}})
-    sys.exit(1)
 if mode == "hang":
     child = subprocess.Popen(["sleep", "600"], start_new_session=True)  # like exec_command: its own group
     open(os.environ["FAKE_CHILD"], "w").write(str(child.pid))
@@ -94,6 +94,24 @@ open(answer, "w").write("Answer: it's all in api.py:1.")
 """
 
 MODEL_ENV = ("CODEX_AGENT_MODEL", "CODEX_AGENT_EFFORT", "CODEX_AGENT_HEAVY_MODEL", "CODEX_AGENT_HEAVY_EFFORT")
+ALL_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"]
+
+
+def catalog(*drop: str) -> str:
+    """`codex debug models` output, best model first; `drop` leaves models out."""
+    models = [
+        ("gpt-6.1-sol", "list", ALL_EFFORTS),
+        ("gpt-6-astra", "list", ALL_EFFORTS[:5]),
+        ("gpt-6.1-terra", "list", ALL_EFFORTS),
+        ("gpt-6-sol", "list", ALL_EFFORTS),
+        ("gpt-6-luna", "list", ALL_EFFORTS[:3]),
+        ("gpt-hidden", "hide", ALL_EFFORTS),
+    ]
+    return json.dumps({"models": [
+        {"slug": slug, "visibility": visibility, "priority": index, "base_instructions": "…",
+         "supported_reasoning_levels": [{"effort": effort, "description": "…"} for effort in efforts]}
+        for index, (slug, visibility, efforts) in enumerate(models, 1) if slug not in drop
+    ]})  # fmt: skip
 
 
 @pytest.fixture
@@ -110,6 +128,7 @@ def env(tmp_path: Path) -> dict[str, str]:
         "CODEX_AGENT_HOME": str(tmp_path / "home"),
         "FAKE_LOG": str(tmp_path / "calls.jsonl"),
         "FAKE_CHILD": str(tmp_path / "child.pid"),
+        "FAKE_CATALOG": catalog(),
     }
 
 
@@ -164,6 +183,7 @@ def test_explore_runs_in_sandbox_and_is_isolated(env, repo):
     assert "multi_agent" in argv and "hooks" in argv and argv[-1] == "-"
     assert Path(call["cwd"]).resolve() == repo.resolve() and argv[argv.index("-C") + 1] == str(repo)
     assert "scouting subagent" in call["prompt"] and "Commands run in a sandbox" in call["prompt"]
+    assert "Don't stop at the first plausible cause" in call["prompt"] and "Keep the code clean" not in call["prompt"]
     assert call["prompt"].rstrip().endswith("where is handler?")
     out = result.stdout
     assert "codex gpt-6.1-terra · xhigh · explore · sandbox" in out and "Codex patches" not in out
@@ -186,24 +206,83 @@ def test_hard_bug_and_backend_run_on_the_heavy_model(env, repo, flag):
     assert "codex gpt-6.1-sol · high" in result.stdout and runs(env)[0]["model"] == "gpt-6.1-sol"
 
 
-def test_models_come_from_env(env, repo):
-    custom = {**env, "CODEX_AGENT_MODEL": "m-fast", "CODEX_AGENT_EFFORT": "low", "CODEX_AGENT_HEAVY_MODEL": "m-big"}
+def test_default_models_come_from_env(env, repo):
+    custom = {**env, "CODEX_AGENT_MODEL": "gpt-6-astra", "CODEX_AGENT_EFFORT": "low", "CODEX_AGENT_HEAVY_MODEL": "gpt-6-sol"}
     assert run(custom, "-C", str(repo), "x").returncode == 0
     assert run(custom, "-C", str(repo), "--heavy", "x").returncode == 0
     first, second = calls(env)
-    assert model_of(first) == "m-fast" and 'model_reasoning_effort="low"' in first["argv"]
-    assert model_of(second) == "m-big" and 'model_reasoning_effort="high"' in second["argv"]
+    assert model_of(first) == "gpt-6-astra" and 'model_reasoning_effort="low"' in first["argv"]
+    assert model_of(second) == "gpt-6-sol" and 'model_reasoning_effort="high"' in second["argv"]
 
 
-def test_missing_model_falls_back_to_codex_defaults(env, repo):
-    result = run(env, "-C", str(repo), "x", mode="nomodel")
+def test_default_model_the_account_lacks_gives_way_to_codex_default(env, repo):
+    result = run({**env, "FAKE_CATALOG": catalog("gpt-6.1-terra")}, "-C", str(repo), "x")
     assert result.returncode == 0, result.stdout + result.stderr
-    first, second = calls(env)
-    assert model_of(first) == "gpt-6.1-terra"
-    assert model_of(second) is None and not any("model_reasoning_effort" in a for a in second["argv"])
-    assert "isn't available on this account — retrying on Codex's defaults" in result.stdout
-    meta = runs(env)[0]
-    assert meta["model"] is None and meta["effort"] is None and meta["status"] == "ok"
+    argv = calls(env)[0]["argv"]
+    assert "-m" not in argv and not any("model_reasoning_effort" in a for a in argv)
+    assert "codex default model · default effort" in result.stdout
+    assert "note: gpt-6.1-terra isn't among this account's models, so Codex picks its default model" in result.stdout
+    assert runs(env)[0]["model"] is None
+
+
+@pytest.mark.parametrize(
+    ("flags", "model", "effort"),
+    [
+        (["--model", "astra", "--effort", "max"], "gpt-6-astra", "max"),  # part of the name, the user's effort
+        (["--model", "sol"], "gpt-6.1-sol", "xhigh"),  # the newest Sol, the mode's effort
+        (["--model", "GPT 6 Sol", "--heavy"], "gpt-6-sol", "high"),
+        (["--model", "gpt-hidden"], "gpt-hidden", "xhigh"),  # an exact slug works even when the picker hides it
+        (["--effort", "low"], "gpt-6.1-terra", "low"),
+    ],
+)
+def test_the_model_the_user_names(env, repo, flags, model, effort):
+    result = run(env, "-C", str(repo), *flags, "x")
+    assert result.returncode == 0, result.stdout + result.stderr
+    call = calls(env)[0]
+    assert model_of(call) == model and f'model_reasoning_effort="{effort}"' in call["argv"]
+    assert f"codex {model} · {effort}" in result.stdout and "note:" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("flags", "message"),
+    [
+        (["--model", "nope"], "--model: the account has no 'nope'; its models: gpt-6.1-sol, gpt-6-astra"),
+        (["--model", "luna", "--effort", "max"], "--effort: gpt-6-luna supports low, medium, high, not 'max'"),
+        (["--model", "hidden"], "the account has no 'hidden'"),  # parts of names only match listed models
+    ],
+)
+def test_a_model_or_effort_the_account_lacks_is_an_error(env, repo, flags, message):
+    result = run(env, "-C", str(repo), *flags, "x")
+    assert result.returncode == 2 and message in result.stderr
+    assert not Path(env["FAKE_LOG"]).exists()
+
+
+def test_a_default_effort_the_model_lacks_gives_way_to_its_own(env, repo):
+    result = run(env, "-C", str(repo), "--model", "luna", "x")
+    assert result.returncode == 0, result.stdout + result.stderr
+    call = calls(env)[0]
+    assert model_of(call) == "gpt-6-luna" and not any("model_reasoning_effort" in a for a in call["argv"])
+    assert "note: gpt-6-luna has no xhigh effort, so it runs on its default" in result.stdout
+
+
+def test_without_a_catalog_names_go_to_codex_as_they_are(env, repo):
+    plain = {k: v for k, v in env.items() if k != "FAKE_CATALOG"}
+    assert run(plain, "-C", str(repo), "--model", "astra", "--effort", "ultra", "x").returncode == 0
+    call = calls(env)[0]
+    assert model_of(call) == "astra" and 'model_reasoning_effort="ultra"' in call["argv"]
+
+
+def test_models_lists_the_account_models(env):
+    result = run(env, "--models")
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[0].startswith("gpt-6.1-sol  ") and lines[0].endswith("ultra  ← --heavy, --backend")
+    assert any(line.startswith("gpt-6.1-terra") and line.endswith("← exploration") for line in lines)
+    assert "gpt-6-luna     low, medium, high" in result.stdout and "gpt-hidden" not in result.stdout
+    assert not Path(env["FAKE_LOG"]).exists()
+    plain = {k: v for k, v in env.items() if k != "FAKE_CATALOG"}
+    result = run(plain, "--models")
+    assert result.returncode == 1 and "can't list models" in result.stdout
 
 
 def test_yolo_drops_the_sandbox(env, repo):
@@ -235,6 +314,8 @@ def test_backend_separates_codex_patches_from_other_changes(env, repo):
     assert result.returncode == 0, result.stdout + result.stderr
     prompt = calls(env)[0]["prompt"]
     assert "subagent that writes the code" in prompt and "Do only the backend" in prompt
+    assert "Carry the change through" in prompt and "No defensive code for things that can't happen" in prompt
+    assert "What's left: frontend, migrations" in prompt and "In UI code" not in prompt
     out = result.stdout
     assert "backend · sandbox" in out and "← api.py" in out
     assert "Codex patches: api.py\n" in out
@@ -265,6 +346,7 @@ def test_allow_frontend(env, repo):
     assert result.returncode == 0, result.stdout + result.stderr
     prompt = calls(env)[0]["prompt"]
     assert "frontend included" in prompt and "Do only the backend" not in prompt
+    assert "In UI code, reuse the project's components" in prompt and "What's left: migrations" in prompt
     assert "Codex patches: api.py, static/app.css" in result.stdout and "⚠" not in result.stdout
 
 

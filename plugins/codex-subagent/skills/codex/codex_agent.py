@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """Codex CLI as a Claude subagent: exploration on the default model, hard bugs (--heavy) and backend work on request
-on the heavy model.
+on the heavy model, or any model the account has (--model, --effort).
 
     python3 codex_agent.py -C /abs/project "task"
     python3 codex_agent.py -C /abs/project --heavy "hard bug"
+    python3 codex_agent.py -C /abs/project --model astra --effort max "task"
     python3 codex_agent.py -C /abs/project --backend -f /abs/task.md
     python3 codex_agent.py --resume <run> "follow-up"
+    python3 codex_agent.py --models
 
 Codex runs in a workspace-write sandbox (writes inside the project and /tmp, network on), or with full access under
 --yolo, and without ~/.codex/config.toml: no MCP, notify, plugins or account connectors. The mode is a role in the
 prompt: exploration doesn't edit the project, backend edits only the backend. Prints one line per step, then the
 summary, the changes in the tree and the full report; everything is kept in ~/.claude/codex-agent/runs/<run>/.
 
-Models: CODEX_AGENT_MODEL / CODEX_AGENT_EFFORT (exploration), CODEX_AGENT_HEAVY_MODEL / CODEX_AGENT_HEAVY_EFFORT
-(--heavy and --backend). A model the account doesn't have falls back to Codex's default model.
+Default models: CODEX_AGENT_MODEL / CODEX_AGENT_EFFORT (exploration), CODEX_AGENT_HEAVY_MODEL /
+CODEX_AGENT_HEAVY_EFFORT (--heavy and --backend). A default the account lacks gives way to Codex's own; an explicit
+--model or --effort it lacks is an error.
 
 Exit codes: 0 — report ready, 1 — Codex failed or isn't installed, 2 — bad arguments, 3 — finished without a report,
 124 — timeout, 130 — interrupted.
@@ -39,7 +42,7 @@ from typing import Any
 
 # Exploration runs on Terra xhigh: close to Sol, but several times faster; on max it isn't better and wanders outside
 # exploration. Sol is for hard bugs (--heavy) and backend work. A continuation (--resume) keeps the parent's model
-# unless a flag asks for the heavy one.
+# unless a flag asks for another one.
 DEFAULT_MODEL = (os.environ.get("CODEX_AGENT_MODEL") or "gpt-6.1-terra", os.environ.get("CODEX_AGENT_EFFORT") or "xhigh")
 HEAVY_MODEL = (
     os.environ.get("CODEX_AGENT_HEAVY_MODEL") or "gpt-6.1-sol", os.environ.get("CODEX_AGENT_HEAVY_EFFORT") or "high"
@@ -54,12 +57,6 @@ BUSY = re.compile(r"\b429\b|too many requests", re.IGNORECASE)
 BUSY_WAIT_MIN = 240.0  # minutes to wait for a slot before giving up
 BUSY_PAUSE = (15.0, 90.0)  # first and longest pause between attempts, seconds
 CONTINUE_AFTER_BUSY = "Continue the same task from where you stopped."
-# The account has no such model (or no such effort for it): one more attempt on Codex's defaults.
-MISSING_MODEL = re.compile(
-    r"model\b.{0,120}?\b(?:not supported|not found|does not exist|not available|unavailable|do not have access)"
-    r"|unknown model|invalid model|model_not_found|unsupported value.{0,120}?reasoning",
-    re.IGNORECASE | re.DOTALL,
-)
 
 # A bare agent without account connectors, browser, plugins or hooks.
 DISABLED_FEATURES = (
@@ -80,6 +77,8 @@ FRONT_DIRS = {
 
 SHELL_WRAPPER = re.compile(r"""^/bin/(?:ba|z)?sh -l?c (?:'(.*)'|"(.*)")$""", re.DOTALL)
 
+# The rules below counter what Codex does by default: it stops at the first plausible answer and offers to do more
+# instead of doing it, wraps code in layers and safety nets nobody asked for, and has weak taste in UI.
 COMMON_HEAD = """You were started by another agent (Claude, the orchestrator) in non-interactive mode: the orchestrator \
 reads your report, not the user. Rules from AGENTS.md about the length and format of replies to the user don't apply \
 here: make the report as complete as accuracy needs, without filler."""
@@ -90,7 +89,7 @@ YOLO_ACCESS = "Access is full, with no sandbox."
 
 EXPLORE_RULES = """You are a scouting subagent. {head}
 
-Rules for this run:
+How to work:
 - This is exploration: don't edit project files, don't commit, don't create branches. {access} Otherwise you're free \
 to run tests and scripts, reproduce the bug, start services and use the network; put temporary files in /tmp. Stop \
 anything you started in the background before reporting.
@@ -99,6 +98,16 @@ report.
 - Scope: the project {dir} and the paths the task names explicitly. Don't explore the environment, processes, \
 ~/.codex, ~/.claude or unrelated folders unless the task names them.
 - Search with rg and read the ranges you need, not whole files. Back every conclusion with code or a run, not a guess.
+
+Go all the way:
+- Answer the question behind the task, not just its wording: if it asks where something breaks, also find why and \
+what fixes it.
+- Don't stop at the first plausible cause. Follow the chain to where the behavior really comes from (callers, config, \
+data), confirm it with code or a run, and check whether anything else contributes.
+- Don't end with offers like "if you want, I can…". If a check fits your role and makes the answer firmer, run it \
+now; anything else goes in the report as a finding.
+- A fix plan is the smallest change that removes the cause, in the style of the existing code: no new layers, \
+fallbacks or defensive checks. If the small fix isn't enough, say so and describe the bigger change separately.
 
 The report is your last message, sized to the question: a few lines for a narrow question, detail for a mechanism.
 1. The direct answer to the task's question, as the first paragraph.
@@ -110,10 +119,13 @@ BACKEND_ONLY = """Do only the backend for the task: server code, APIs, databases
 and scripts, their tests. Don't touch the frontend (layout, styles, components, client code, UI copy), even if the \
 task isn't finished without it: describe in the report what the frontend needs, the orchestrator will do it."""
 FULL_STACK = "Do the task, frontend included."
+UI_RULE = """
+- In UI code, reuse the project's components, styles and tokens. Don't invent new colors, spacing, fonts or copy, and \
+change only what the task asks."""
 
 BACKEND_RULES = """You are a subagent that writes the code. {head}
 
-Rules for this run:
+How to work:
 - {scope}
 - Edit code only inside {dir}. Don't commit, push, create branches or worktrees, or deploy: delivery rules from \
 AGENTS.md (commit, push, release scripts, deploy) are off for this run, the orchestrator delivers after checking. \
@@ -121,9 +133,23 @@ AGENTS.md (commit, push, release scripts, deploy) are off for this run, the orch
 before reporting.
 - Work autonomously and don't ask questions. If something is ambiguous, pick a reasonable option and note it in the \
 report.
-- Minimal diff in the style of the neighbouring code; comments only where the code isn't clear without them. Don't \
-weaken or delete tests to get a green run.
-- Check the change with the project's tests or linters that cover it.
+
+Finish the job:
+- Carry the change through: update every caller, type, test and doc it touches, run the tests or linters that cover \
+it, and fix what breaks.
+- Don't leave TODOs, stubs or "you may also want to…" for work inside the task, and don't end with offers to do more.
+- Don't weaken or delete tests to get a green run.
+
+Keep the code clean:
+- Write the simplest code that does the task. No new abstractions, wrappers, options, parameters or files unless the \
+task needs them, and nothing "for later". Change the existing code path instead of adding a parallel one; reuse \
+existing helpers instead of writing new ones.
+- No defensive code for things that can't happen: no try/except around code that doesn't fail in practice, no \
+swallowed errors, no fallbacks or default values that hide a missing value, no checks for states the code already \
+rules out, no retries or compatibility branches nobody asked for. Validate only at real boundaries (user input, \
+network, files, external APIs) and let other errors surface.
+- Match the neighbouring code: naming, structure, error handling, comment density. Delete code your change makes \
+dead. No commented-out code, debug prints or stray files.{ui}
 
 The report is your last message:
 1. What you did, in one paragraph.
@@ -137,8 +163,8 @@ RESUME_HEAD = "Continuation of the same task. The rules for this turn follow and
 def rules(mode: str, workdir: Path, yolo: bool = False, frontend: bool = False) -> str:
     access = YOLO_ACCESS if yolo else SANDBOX_ACCESS
     if mode == "backend":
-        scope, left = (FULL_STACK, "") if frontend else (BACKEND_ONLY, "frontend, ")
-        return BACKEND_RULES.format(head=COMMON_HEAD, dir=workdir, access=access, scope=scope, left=left)
+        scope, ui, left = (FULL_STACK, UI_RULE, "") if frontend else (BACKEND_ONLY, "", "frontend, ")
+        return BACKEND_RULES.format(head=COMMON_HEAD, dir=workdir, access=access, scope=scope, ui=ui, left=left)
     return EXPLORE_RULES.format(head=COMMON_HEAD, dir=workdir, access=access)
 
 
@@ -147,15 +173,6 @@ def build_prompt(mode: str, workdir: Path, task: str, resumed: bool, yolo: bool 
     if resumed:
         return f"{RESUME_HEAD}\n\n{body}\n\n## Follow-up\n\n{task}\n"
     return f"{body}\n\n## Task\n\n{task}\n"
-
-
-def pick_model(heavy: bool, backend: bool, parent: dict[str, Any] | None) -> tuple[str | None, str | None]:
-    """(model, effort); (None, None) means Codex's own defaults."""
-    if heavy or backend:
-        return HEAVY_MODEL
-    if parent:
-        return parent.get("model"), parent.get("effort")
-    return DEFAULT_MODEL
 
 
 class SetupError(Exception):
@@ -174,6 +191,85 @@ def cli_support() -> tuple[list[str], bool]:
         raise SetupError(f"codex exec --help failed: {error}") from None
     flags = [flag for flag in ISOLATION_FLAGS if re.search(rf"{flag}\b(?!-)", out)]
     return flags, bool(re.search(r"--disable[ =<]", out))
+
+
+def model_catalog() -> list[dict[str, Any]] | None:
+    """The account's models, best first, with the efforts each supports; None when this CLI can't list them."""
+    try:
+        out = subprocess.run(
+            ["codex", "debug", "models"], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL
+        )  # fmt: skip
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        models = [
+            {
+                "slug": m["slug"], "listed": m["visibility"] == "list", "priority": m["priority"],
+                "efforts": [level["effort"] for level in m["supported_reasoning_levels"]],
+            }  # fmt: skip
+            for m in json.loads(out.stdout)["models"]
+        ]
+    except (ValueError, KeyError, TypeError):
+        return None
+    return sorted(models, key=lambda m: m["priority"])
+
+
+def squash(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def resolve_model(name: str, models: list[dict[str, Any]]) -> dict[str, Any]:
+    """An exact slug, or the best listed model whose slug contains the name: `astra` is gpt-6-astra, `sol` the newest
+    Sol."""
+    key = squash(name)
+    hits = [m for m in models if squash(m["slug"]) == key] or [
+        m for m in models if m["listed"] and key in squash(m["slug"])
+    ]
+    if not hits:
+        listed = ", ".join(m["slug"] for m in models if m["listed"])
+        raise UsageError(f"--model: the account has no {name!r}; its models: {listed}")
+    return hits[0]
+
+
+def pick_model(
+    args: argparse.Namespace, parent: dict[str, Any] | None, models: list[dict[str, Any]] | None
+) -> tuple[str | None, str | None, list[str]]:
+    """Model, effort and notes for this run; None leaves the choice to Codex."""
+    if args.heavy or args.backend:
+        name, effort = HEAVY_MODEL
+    elif parent:
+        name, effort = parent["model"], parent["effort"]
+    else:
+        name, effort = DEFAULT_MODEL
+    name, effort = args.model or name, args.effort or effort
+    if models is None:  # this CLI can't list models: names go to Codex as they are
+        return name, effort, []
+    entry = resolve_model(args.model, models) if args.model else next((m for m in models if m["slug"] == name), None)
+    notes = []
+    if entry is None:
+        if name:
+            notes.append(f"{name} isn't among this account's models, so Codex picks its default model")
+        return None, args.effort, notes
+    if effort and effort not in entry["efforts"]:
+        if args.effort:
+            raise UsageError(f"--effort: {entry['slug']} supports {', '.join(entry['efforts'])}, not {effort!r}")
+        notes.append(f"{entry['slug']} has no {effort} effort, so it runs on its default")
+        effort = None
+    return entry["slug"], effort, notes
+
+
+def print_models(models: list[dict[str, Any]] | None) -> int:
+    if models is None:
+        print("this Codex CLI can't list models (codex debug models) — update Codex")
+        return 1
+    roles = {HEAVY_MODEL[0]: "  ← --heavy, --backend", DEFAULT_MODEL[0]: "  ← exploration"}
+    listed = [m for m in models if m["listed"]]
+    width = max(len(m["slug"]) for m in listed)
+    for m in listed:
+        print(f"{m['slug']:<{width}}  {', '.join(m['efforts'])}{roles.get(m['slug'], '')}")
+    return 0
 
 
 def codex_command(
@@ -335,18 +431,10 @@ class Run:
         self.lock = threading.Lock()
         self.last_print = time.time()
 
-    def reason(self) -> str:
-        return self.fatal or (self.errors[-1] if self.errors else "")
-
     def busy(self, code: int) -> bool:
         """The attempt failed on a 429 (the account's parallel slots are taken), not on a usage limit or its own error."""
-        text = self.reason()
+        text = self.fatal or (self.errors[-1] if self.errors else "")
         return (code != 0 or self.failed) and bool(BUSY.search(text)) and "usage limit" not in text.lower()
-
-    def missing_model(self, code: int, stderr: str) -> bool:
-        """The attempt failed before any work because the account has no such model or effort."""
-        failed = code != 0 or self.failed
-        return failed and not self.worked and bool(MISSING_MODEL.search(f"{self.reason()}\n{stderr}"))
 
     def retry(self) -> None:
         self.failed = False
@@ -536,6 +624,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--backend", action="store_true", help="the 'writes backend code' role instead of exploration")
     parser.add_argument("--allow-frontend", action="store_true", help="with --backend: frontend may be edited too")
     parser.add_argument("--heavy", "--sol", dest="heavy", action="store_true", help="hard bug: the heavy model")
+    parser.add_argument("-m", "--model", help="any model the account has: a slug or part of it (astra, sol)")
+    parser.add_argument("--effort", help="reasoning effort: low, medium, high, xhigh, max…")
+    parser.add_argument("--models", action="store_true", help="list the account's models and their efforts")
     parser.add_argument(
         "--yolo", action="store_true", default=os.environ.get("CODEX_AGENT_YOLO") == "1",
         help="no sandbox and no approvals (default: CODEX_AGENT_YOLO=1)",
@@ -553,7 +644,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--timeout must be greater than zero")
     if args.busy_wait < 0:
         parser.error("--busy-wait can't be negative")
-    if not args.prompt and not args.file:
+    if not args.models and not args.prompt and not args.file:
         parser.error("a task is required: text or -f file")
     return args
 
@@ -564,6 +655,9 @@ def model_label(model: tuple[str | None, str | None]) -> str:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
+    if args.models:
+        cli_support()
+        return print_models(model_catalog())
     parent = find_run(args.resume) if args.resume else None
     if parent and not parent.get("thread"):
         raise UsageError(f"--resume: run {parent['id']} has no thread id — Codex never started, nothing to continue")
@@ -592,9 +686,10 @@ def main(argv: list[str]) -> int:
         raise UsageError("the task is empty")
 
     support = cli_support()
+    name, effort, notes = pick_model(args, parent, model_catalog())
+    model = (name, effort)
     mode = "backend" if args.backend else "explore"
     frontend = args.backend and args.allow_frontend
-    model = pick_model(args.heavy, args.backend, parent)
     thread = parent["thread"] if parent else None
     prompt = build_prompt(mode, workdir, task, bool(parent), args.yolo, frontend)
     run_id = new_run_id(args.name)
@@ -619,7 +714,7 @@ def main(argv: list[str]) -> int:
 
     (folder / "prompt.md").write_text(prompt)
     meta: dict[str, Any] = {
-        "id": run_id, "dir": str(workdir), "mode": mode, "model": model[0], "effort": model[1], "yolo": args.yolo,
+        "id": run_id, "dir": str(workdir), "mode": mode, "model": name, "effort": effort, "yolo": args.yolo,
         "parent": parent["id"] if parent else None, "thread": thread, "status": "running", "started_at": time.time(),
     }  # fmt: skip
     write_meta(folder, meta)
@@ -630,7 +725,9 @@ def main(argv: list[str]) -> int:
     print(f"codex {model_label(model)} · {mode} · {access} · {workdir} · run {run_id}{resumed}", flush=True)
     missing = [flag for flag in ISOLATION_FLAGS if flag not in support[0]]
     if missing:
-        print(f"note: this Codex CLI has no {', '.join(missing)}: your ~/.codex config applies — update Codex", flush=True)
+        notes.append(f"this Codex CLI has no {', '.join(missing)}: your ~/.codex config applies — update Codex")
+    for note in notes:
+        print(f"note: {note}", flush=True)
 
     run = Run(before[0] if before else workdir, meta["started_at"])
     state: dict[str, Any] = {"timed_out": False, "stopped": False, "process": None}
@@ -666,18 +763,7 @@ def main(argv: list[str]) -> int:
                     write_meta(folder, meta)
                     print(f"■ ERROR · codex failed to start: {error}", flush=True)
                     return 1
-                if state["timed_out"] or state["stopped"]:
-                    break
-                stderr_text = (folder / "stderr.log").read_text(errors="replace")
-                if (model[0] or model[1]) and run.missing_model(code, stderr_text):
-                    run.say(f"! {model_label(model)} isn't available on this account — retrying on Codex's defaults")
-                    model = (None, None)
-                    meta.update(model=None, effort=None)
-                    write_meta(folder, meta)
-                    attempt_command = codex_command(workdir, answer, thread, model, args.yolo, support)
-                    run.retry()
-                    continue
-                if not run.busy(code):
+                if state["timed_out"] or state["stopped"] or not run.busy(code):
                     break
                 waited += time.monotonic() - attempt_started  # the attempt itself waits too: the CLI retries 429s inside
                 if waited >= budget:

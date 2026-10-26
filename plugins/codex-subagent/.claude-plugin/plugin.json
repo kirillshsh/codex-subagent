@@ -1,6 +1,6 @@
 {
   "name": "codex-subagent",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Codex CLI as a Claude Code subagent: code exploration, hard-bug diagnosis and backend work on request.",
   "author": {
     "name": "kirillshsh"
